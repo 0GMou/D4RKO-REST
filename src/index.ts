@@ -87,4 +87,202 @@ function toInstallers(m: any): any[] {
 
   return installers.map((ins: any, idx: number) => {
     const item: any = {
-      InstallerIdentifier:
+      InstallerIdentifier: `${m.PackageIdentifier}-${m.PackageVersion}-${idx + 1}`,
+      InstallerSha256: ins.InstallerSha256,
+      InstallerUrl: ins.InstallerUrl,
+      Architecture: ins.Architecture,
+      InstallerType: ins.InstallerType ?? topInstallerType,
+    };
+    const nestedType = ins.NestedInstallerType ?? topNestedType;
+    const nestedFiles = ins.NestedInstallerFiles ?? topNestedFiles;
+    if (nestedType) item.NestedInstallerType = nestedType;
+    if (nestedFiles) item.NestedInstallerFiles = nestedFiles;
+    return item;
+  });
+}
+
+// Locales[] (opcional en respuesta REST)
+function toLocales(m: any): any[] | undefined {
+  if (!m.PackageLocale) return undefined;
+  const loc: any = {
+    PackageLocale: m.PackageLocale,
+    Publisher: m.Publisher ?? PUBLISHER,
+    PackageName: m.PackageName ?? "MPV",
+  };
+  if (m.ShortDescription) loc.ShortDescription = m.ShortDescription;
+  if (m.PublisherUrl) loc.PublisherUrl = m.PublisherUrl;
+  if (m.PackageUrl) loc.PackageUrl = m.PackageUrl;
+  if (m.ReleaseNotes) loc.ReleaseNotes = m.ReleaseNotes;
+  if (m.ReleaseNotesUrl) loc.ReleaseNotesUrl = m.ReleaseNotesUrl;
+  return [loc];
+}
+
+// /information (según OpenAPI 1.9.0)
+function informationResponse() {
+  return {
+    Data: {
+      SourceIdentifier: "D4RKO",
+      ServerSupportedVersions: SUPPORTED_API_VERSIONS,
+      Authentication: { AuthenticationType: "none" },
+      UnsupportedPackageMatchFields: [],
+      RequiredPackageMatchFields: [],
+      UnsupportedQueryParameters: [],
+      RequiredQueryParameters: [],
+      SourceAgreements: [],
+    },
+  };
+}
+
+function manifestSingle(m: any) {
+  const version = {
+    PackageVersion: m.PackageVersion,
+    Installers: toInstallers(m),
+    ...(toLocales(m) ? { Locales: toLocales(m) } : {}),
+  };
+  return {
+    Data: { PackageIdentifier: m.PackageIdentifier, Versions: [version] },
+  };
+}
+
+function manifestMultiple(multi: any[]) {
+  return {
+    Data: multi.map((m) => ({
+      PackageIdentifier: m.PackageIdentifier,
+      Versions: [
+        {
+          PackageVersion: m.PackageVersion,
+          Installers: toInstallers(m),
+          ...(toLocales(m) ? { Locales: toLocales(m) } : {}),
+        },
+      ],
+    })),
+  };
+}
+
+function searchResult(versions: string[], pkgName: string) {
+  return {
+    Data: [
+      {
+        PackageIdentifier: PACKAGE_IDENTIFIER,
+        PackageName: pkgName,
+        Publisher: PUBLISHER,
+        Versions: versions.map((v) => ({ PackageVersion: v })),
+      },
+    ],
+    RequiredPackageMatchFields: [],
+    UnsupportedPackageMatchFields: [],
+  };
+}
+
+// ---------- HANDLERS ----------
+async function handleInformation() {
+  return json(informationResponse());
+}
+
+async function handleManifestSearch(req: Request) {
+  let body: any = {};
+  try { body = await req.json(); } catch { /* vacío */ }
+
+  const maxResults: number | undefined = body?.MaximumResults;
+  const key: string | undefined = body?.Query?.KeyWord;
+
+  if (key && !/mpv|d4rko\.mpv/i.test(key)) {
+    return json({ Data: [], RequiredPackageMatchFields: [], UnsupportedPackageMatchFields: [] });
+  }
+
+  const versions = await listVersions();
+  if (versions.length === 0) return json({ Data: [] }); // rate limit o vacío
+
+  const cut = maxResults && maxResults > 0 ? versions.slice(0, maxResults) : [versions[0]];
+  const m = await loadSingleton(versions[0]);
+  const pkgName = m.PackageName ?? "MPV";
+  return json(searchResult(cut, pkgName));
+}
+
+async function handlePackageManifestsAll() {
+  const versions = await listVersions();
+  const manifests = await Promise.all(versions.map((v) => loadSingleton(v)));
+  return json(manifestMultiple(manifests));
+}
+
+async function handlePackageManifestsById(id: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  const versions = await listVersions();
+  if (versions.length === 0) return notFound("No versions");
+  const manifests = await Promise.all(versions.map((v) => loadSingleton(v)));
+  return json(manifestMultiple(manifests));
+}
+
+async function handlePackages() {
+  return json({ Data: [{ PackageIdentifier: PACKAGE_IDENTIFIER }] });
+}
+
+async function handlePackagesById(id: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  return json({ Data: { PackageIdentifier: PACKAGE_IDENTIFIER } });
+}
+
+async function handleVersionsById(id: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  const versions = await listVersions();
+  return json({ Data: versions.map((v) => ({ PackageVersion: v })) });
+}
+
+async function handleVersionDetail(id: string, ver: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  const m = await loadSingleton(ver).catch(() => null);
+  if (!m) return notFound("Version not found");
+  return json({ Data: { PackageIdentifier: PACKAGE_IDENTIFIER, PackageVersion: ver } });
+}
+
+async function handleInstallers(id: string, ver: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  const m = await loadSingleton(ver).catch(() => null);
+  if (!m) return notFound("Version not found");
+  return json({ Data: toInstallers(m) });
+}
+
+async function handleLocales(id: string, ver: string) {
+  if (id.toLowerCase() !== PACKAGE_IDENTIFIER) return notFound("Unknown PackageIdentifier");
+  const m = await loadSingleton(ver).catch(() => null);
+  if (!m) return notFound("Version not found");
+  const l = toLocales(m);
+  return json({ Data: l ?? [] });
+}
+
+// ---------- ROUTER ----------
+export default {
+  async fetch(req: Request): Promise<Response> {
+    try {
+      const url = new URL(req.url);
+      const pathname = url.pathname.replace(/\/+$/, "") || "/";
+
+      if (req.method === "GET" && pathname === "/information") return handleInformation();
+      if (req.method === "POST" && pathname === "/manifestSearch") return handleManifestSearch(req);
+      if (req.method === "GET" && pathname === "/packageManifests") return handlePackageManifestsAll();
+
+      let m = pathname.match(/^\/packageManifests\/([^/]+)$/);
+      if (req.method === "GET" && m) return handlePackageManifestsById(m[1]);
+
+      if (req.method === "GET" && pathname === "/packages") return handlePackages();
+      m = pathname.match(/^\/packages\/([^/]+)$/);
+      if (req.method === "GET" && m) return handlePackagesById(m[1]);
+
+      m = pathname.match(/^\/packages\/([^/]+)\/versions$/);
+      if (req.method === "GET" && m) return handleVersionsById(m[1]);
+
+      m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)$/);
+      if (req.method === "GET" && m) return handleVersionDetail(m[1], m[2]);
+
+      m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/installers$/);
+      if (req.method === "GET" && m) return handleInstallers(m[1], m[2]);
+
+      m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/locales$/);
+      if (req.method === "GET" && m) return handleLocales(m[1], m[2]);
+
+      return notFound();
+    } catch (e: any) {
+      return json({ ErrorCode: "ServerError", Message: e?.message ?? "Unhandled error" }, 500);
+    }
+  },
+};
