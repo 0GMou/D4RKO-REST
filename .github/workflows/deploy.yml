@@ -1,3 +1,10 @@
+name: Deploy Cloudflare Worker (D4RKO-REST)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
