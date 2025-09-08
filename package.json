@@ -1,1 +1,16 @@
-
+{
+  "name": "d4rko-rest",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "yaml": "^2.5.1"
+  }
+}
