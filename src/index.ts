@@ -1,25 +1,28 @@
-// Cloudflare Worker – WinGet REST 1.9.0 (solo lectura)
-// Endpoints soportados en 3 variantes de ruta: "/", "/api", y "/vX(.Y)".
-// Cumple OpenAPI de winget REST. Lee YAML "singleton" desde 0GMou/D4RKO-WINGET.
+// Cloudflare Worker — WinGet REST (solo lectura) para D4RKO
+// Cumple los contratos públicos de la API REST del Windows Package Manager.
+// Lee manifests Singleton YAML desde 0GMou/D4RKO-WINGET y los expone como REST.
 
+// ---------- Dependencias ----------
 import YAML from "yaml";
 
-// ---------- CONFIG ----------
+// ---------- Config ----------
 const OWNER = "0GMou";
 const WINGET_REPO = "D4RKO-WINGET";
 const PACKAGE_IDENTIFIER = "d4rko.mpv";
 const PUBLISHER = "D4RKO";
 const BASE_DIR = "manifests/d/d4rko/d4rko.mpv";
+
+// GitHub
 const GH_API = `https://api.github.com/repos/${OWNER}/${WINGET_REPO}/contents/${BASE_DIR}`;
 const GH_RAW = (version: string) =>
   `https://raw.githubusercontent.com/${OWNER}/${WINGET_REPO}/main/${BASE_DIR}/${version}/${PACKAGE_IDENTIFIER}.yaml`;
-
 const GH_HEADERS = {
   "user-agent": "d4rko-rest",
   accept: "application/vnd.github+json",
 };
 
-// Anunciamos todas para negociar con cualquier cliente
+// ¡Importante! Versiones REST que anuncia el servidor.
+// (Cliente 1.12 negocia con 1.10.0 sin problema; no existe 1.12.0 de la REST.)
 const SUPPORTED_API_VERSIONS = [
   "1.0.0",
   "1.1.0",
@@ -31,14 +34,15 @@ const SUPPORTED_API_VERSIONS = [
   "1.7.0",
   "1.8.0",
   "1.9.0",
+  "1.10.0",
 ];
 
-// ---------- RESPUESTAS ----------
+// ---------- Helpers de respuesta ----------
 function json(data: unknown, status = 200, headers: HeadersInit = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      "content-type": "application/json",
       "cache-control": "public, max-age=120",
       ...headers,
     },
@@ -48,7 +52,7 @@ function notFound(msg = "Not Found") {
   return json({ ErrorCode: "NotFound", Message: msg }, 404);
 }
 
-// ---------- UTIL ----------
+// ---------- Utilidades ----------
 function bySemverDesc(a: string, b: string) {
   const pa = a.split(".").map((s) => parseInt(s, 10));
   const pb = b.split(".").map((s) => parseInt(s, 10));
@@ -64,7 +68,7 @@ function bySemverDesc(a: string, b: string) {
 async function listVersions(): Promise<string[]> {
   const r = await fetch(GH_API, { headers: GH_HEADERS });
   if (!r.ok) {
-    if (r.status === 403) return []; // rate limit → vacío temporalmente
+    if (r.status === 403) return []; // rate limit → sin datos temporales
     throw new Error(`GitHub API error: ${r.status}`);
   }
   const items: Array<{ name: string; type: string }> = await r.json();
@@ -80,7 +84,6 @@ async function loadSingleton(version: string): Promise<any> {
   return YAML.parse(text);
 }
 
-// Installer[] desde un singleton ZIP portable (esquema 1.6/1.9)
 function toInstallers(m: any): any[] {
   const installers = Array.isArray(m.Installers) ? m.Installers : [];
   const topInstallerType = m.InstallerType;
@@ -103,7 +106,6 @@ function toInstallers(m: any): any[] {
   });
 }
 
-// Locales[] (opcional en REST)
 function toLocales(m: any): any[] | undefined {
   if (!m.PackageLocale) return undefined;
   const loc: any = {
@@ -119,7 +121,6 @@ function toLocales(m: any): any[] | undefined {
   return [loc];
 }
 
-// /information (OpenAPI 1.9.0)
 function informationResponse() {
   return {
     Data: {
@@ -150,42 +151,39 @@ function manifestMultiple(multi: any[]) {
   };
 }
 
-// ---------- HANDLERS ----------
+// ---------- Handlers ----------
 async function handleInformation() {
   return json(informationResponse());
 }
 
 async function handleManifestSearch(req: Request) {
-  // Aceptamos POST y GET (GET trata como consulta vacía)
   let body: any = {};
   if (req.method === "POST") {
     try {
       body = await req.json();
-    } catch {
-      /* vacío */
-    }
+    } catch { /* vacío */ }
   }
-
   const maxResults: number | undefined = body?.MaximumResults;
   const key: string | undefined = body?.Query?.KeyWord;
 
-  // Solo paquete d4rko.mpv: filtra por keyword si viene
+  // Solo nuestro paquete: filtra por keyword si viene
   if (key && !/mpv|d4rko\.mpv/i.test(key)) {
     return json({ Data: [], RequiredPackageMatchFields: [], UnsupportedPackageMatchFields: [] });
   }
 
   const versions = await listVersions();
-  if (versions.length === 0) return json({ Data: [] }); // rate limit o repo vacío
+  if (versions.length === 0) return json({ Data: [] });
 
   const cut = maxResults && maxResults > 0 ? versions.slice(0, maxResults) : [versions[0]];
   const m = await loadSingleton(versions[0]);
   const pkgName = m.PackageName ?? "MPV";
+
   return json({
     Data: [
       {
         PackageIdentifier: PACKAGE_IDENTIFIER,
         PackageName: pkgName,
-        Publisher: "D4RKO",
+        Publisher: PUBLISHER,
         Versions: cut.map((v) => ({ PackageVersion: v })),
       },
     ],
@@ -245,17 +243,16 @@ async function handleLocales(id: string, ver: string) {
   return json({ Data: l ?? [] });
 }
 
-// ---------- ROUTER & NORMALIZACIÓN ----------
+// ---------- Router & normalización ----------
 function normalizePath(pathname: string) {
-  // quita barras finales
   let p = pathname.replace(/\/+$/, "");
   if (p === "") p = "/";
 
-  // elimina prefijo opcional /api
+  // /api prefix opcional
   if (p === "/api") p = "/";
   else if (p.startsWith("/api/")) p = p.slice(4) || "/";
 
-  // elimina prefijo opcional /vX o /vX.Y (p. ej., /v9.0/information)
+  // /vX o /vX.Y prefix opcional (p.ej. /v9.0/information)
   const vm = p.match(/^\/v\d+(\.\d+)?(\/.*)?$/);
   if (vm) p = p.replace(/^\/v\d+(\.\d+)?/, "") || "/";
 
@@ -267,19 +264,21 @@ export default {
   async fetch(req: Request): Promise<Response> {
     try {
       const url = new URL(req.url);
-      const method = req.method === "HEAD" ? "GET" : req.method; // HEAD → GET
+      const method = req.method === "HEAD" ? "GET" : req.method; // Acepta HEAD como GET
       const pathname = normalizePath(url.pathname);
+
+      // raíz: algunos clientes esperan que / devuelva /information
+      if (method === "GET" && pathname === "/") return handleInformation();
 
       // information
       if (method === "GET" && pathname === "/information") return handleInformation();
 
-      // manifestSearch (POST y GET aceptados)
+      // manifestSearch (POST y GET)
       if ((method === "POST" || method === "GET") && pathname === "/manifestSearch")
         return handleManifestSearch(req);
 
       // packageManifests
       if (method === "GET" && pathname === "/packageManifests") return handlePackageManifestsAll();
-
       let m = pathname.match(/^\/packageManifests\/([^/]+)$/);
       if (method === "GET" && m) return handlePackageManifestsById(m[1]);
 
@@ -287,25 +286,18 @@ export default {
       if (method === "GET" && pathname === "/packages") return handlePackages();
       m = pathname.match(/^\/packages\/([^/]+)$/);
       if (method === "GET" && m) return handlePackagesById(m[1]);
-
       m = pathname.match(/^\/packages\/([^/]+)\/versions$/);
       if (method === "GET" && m) return handleVersionsById(m[1]);
-
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)$/);
       if (method === "GET" && m) return handleVersionDetail(m[1], m[2]);
-
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/installers$/);
       if (method === "GET" && m) return handleInstallers(m[1], m[2]);
-
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/locales$/);
       if (method === "GET" && m) return handleLocales(m[1], m[2]);
 
       return notFound();
     } catch (e: any) {
-      return json(
-        { ErrorCode: "ServerError", Message: e?.message ?? "Unhandled error" },
-        500,
-      );
+      return json({ ErrorCode: "ServerError", Message: e?.message ?? "Unhandled error" }, 500);
     }
   },
 };
