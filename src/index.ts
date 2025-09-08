@@ -1,7 +1,6 @@
 // Cloudflare Worker – WinGet REST 1.9.0 (solo lectura)
-// Lee los manifiestos "singleton" desde 0GMou/D4RKO-WINGET y expone los endpoints
-// /information, POST /manifestSearch, /packageManifests, y /packages/*
-// Ajustado al OpenAPI 1.9.0. No requiere base de datos.
+// Endpoints soportados en 3 variantes de ruta: "/", "/api", y "/vX(.Y)".
+// Cumple OpenAPI de winget REST. Lee YAML "singleton" desde 0GMou/D4RKO-WINGET.
 
 import YAML from "yaml";
 
@@ -17,13 +16,21 @@ const GH_RAW = (version: string) =>
 
 const GH_HEADERS = {
   "user-agent": "d4rko-rest",
-  "accept": "application/vnd.github+json"
+  accept: "application/vnd.github+json",
 };
 
-// Importante: anunciamos varias versiones para negociar con clientes anteriores
+// Anunciamos todas para negociar con cualquier cliente
 const SUPPORTED_API_VERSIONS = [
-  "1.0.0","1.1.0","1.2.0","1.3.0","1.4.0",
-  "1.5.0","1.6.0","1.7.0","1.8.0","1.9.0"
+  "1.0.0",
+  "1.1.0",
+  "1.2.0",
+  "1.3.0",
+  "1.4.0",
+  "1.5.0",
+  "1.6.0",
+  "1.7.0",
+  "1.8.0",
+  "1.9.0",
 ];
 
 // ---------- RESPUESTAS ----------
@@ -37,13 +44,8 @@ function json(data: unknown, status = 200, headers: HeadersInit = {}) {
     },
   });
 }
-
 function notFound(msg = "Not Found") {
   return json({ ErrorCode: "NotFound", Message: msg }, 404);
-}
-
-function badRequest(msg = "Bad Request") {
-  return json({ ErrorCode: "BadRequest", Message: msg }, 400);
 }
 
 // ---------- UTIL ----------
@@ -62,7 +64,7 @@ function bySemverDesc(a: string, b: string) {
 async function listVersions(): Promise<string[]> {
   const r = await fetch(GH_API, { headers: GH_HEADERS });
   if (!r.ok) {
-    if (r.status === 403) return []; // rate limit → devolvemos vacío
+    if (r.status === 403) return []; // rate limit → vacío temporalmente
     throw new Error(`GitHub API error: ${r.status}`);
   }
   const items: Array<{ name: string; type: string }> = await r.json();
@@ -78,7 +80,7 @@ async function loadSingleton(version: string): Promise<any> {
   return YAML.parse(text);
 }
 
-// Installer[] desde un singleton ZIP portable (esquema soportado 1.6/1.9).
+// Installer[] desde un singleton ZIP portable (esquema 1.6/1.9)
 function toInstallers(m: any): any[] {
   const installers = Array.isArray(m.Installers) ? m.Installers : [];
   const topInstallerType = m.InstallerType;
@@ -101,7 +103,7 @@ function toInstallers(m: any): any[] {
   });
 }
 
-// Locales[] (opcional en respuesta REST)
+// Locales[] (opcional en REST)
 function toLocales(m: any): any[] | undefined {
   if (!m.PackageLocale) return undefined;
   const loc: any = {
@@ -117,7 +119,7 @@ function toLocales(m: any): any[] | undefined {
   return [loc];
 }
 
-// /information (según OpenAPI 1.9.0)
+// /information (OpenAPI 1.9.0)
 function informationResponse() {
   return {
     Data: {
@@ -130,17 +132,6 @@ function informationResponse() {
       RequiredQueryParameters: [],
       SourceAgreements: [],
     },
-  };
-}
-
-function manifestSingle(m: any) {
-  const version = {
-    PackageVersion: m.PackageVersion,
-    Installers: toInstallers(m),
-    ...(toLocales(m) ? { Locales: toLocales(m) } : {}),
-  };
-  return {
-    Data: { PackageIdentifier: m.PackageIdentifier, Versions: [version] },
   };
 }
 
@@ -159,44 +150,48 @@ function manifestMultiple(multi: any[]) {
   };
 }
 
-function searchResult(versions: string[], pkgName: string) {
-  return {
-    Data: [
-      {
-        PackageIdentifier: PACKAGE_IDENTIFIER,
-        PackageName: pkgName,
-        Publisher: PUBLISHER,
-        Versions: versions.map((v) => ({ PackageVersion: v })),
-      },
-    ],
-    RequiredPackageMatchFields: [],
-    UnsupportedPackageMatchFields: [],
-  };
-}
-
 // ---------- HANDLERS ----------
 async function handleInformation() {
   return json(informationResponse());
 }
 
 async function handleManifestSearch(req: Request) {
+  // Aceptamos POST y GET (GET trata como consulta vacía)
   let body: any = {};
-  try { body = await req.json(); } catch { /* vacío */ }
+  if (req.method === "POST") {
+    try {
+      body = await req.json();
+    } catch {
+      /* vacío */
+    }
+  }
 
   const maxResults: number | undefined = body?.MaximumResults;
   const key: string | undefined = body?.Query?.KeyWord;
 
+  // Solo paquete d4rko.mpv: filtra por keyword si viene
   if (key && !/mpv|d4rko\.mpv/i.test(key)) {
     return json({ Data: [], RequiredPackageMatchFields: [], UnsupportedPackageMatchFields: [] });
   }
 
   const versions = await listVersions();
-  if (versions.length === 0) return json({ Data: [] }); // rate limit o vacío
+  if (versions.length === 0) return json({ Data: [] }); // rate limit o repo vacío
 
   const cut = maxResults && maxResults > 0 ? versions.slice(0, maxResults) : [versions[0]];
   const m = await loadSingleton(versions[0]);
   const pkgName = m.PackageName ?? "MPV";
-  return json(searchResult(cut, pkgName));
+  return json({
+    Data: [
+      {
+        PackageIdentifier: PACKAGE_IDENTIFIER,
+        PackageName: pkgName,
+        Publisher: "D4RKO",
+        Versions: cut.map((v) => ({ PackageVersion: v })),
+      },
+    ],
+    RequiredPackageMatchFields: [],
+    UnsupportedPackageMatchFields: [],
+  });
 }
 
 async function handlePackageManifestsAll() {
@@ -250,39 +245,67 @@ async function handleLocales(id: string, ver: string) {
   return json({ Data: l ?? [] });
 }
 
-// ---------- ROUTER ----------
+// ---------- ROUTER & NORMALIZACIÓN ----------
+function normalizePath(pathname: string) {
+  // quita barras finales
+  let p = pathname.replace(/\/+$/, "");
+  if (p === "") p = "/";
+
+  // elimina prefijo opcional /api
+  if (p === "/api") p = "/";
+  else if (p.startsWith("/api/")) p = p.slice(4) || "/";
+
+  // elimina prefijo opcional /vX o /vX.Y (p. ej., /v9.0/information)
+  const vm = p.match(/^\/v\d+(\.\d+)?(\/.*)?$/);
+  if (vm) p = p.replace(/^\/v\d+(\.\d+)?/, "") || "/";
+
+  if (p === "") p = "/";
+  return p;
+}
+
 export default {
   async fetch(req: Request): Promise<Response> {
     try {
       const url = new URL(req.url);
-      const pathname = url.pathname.replace(/\/+$/, "") || "/";
+      const method = req.method === "HEAD" ? "GET" : req.method; // HEAD → GET
+      const pathname = normalizePath(url.pathname);
 
-      if (req.method === "GET" && pathname === "/information") return handleInformation();
-      if (req.method === "POST" && pathname === "/manifestSearch") return handleManifestSearch(req);
-      if (req.method === "GET" && pathname === "/packageManifests") return handlePackageManifestsAll();
+      // information
+      if (method === "GET" && pathname === "/information") return handleInformation();
+
+      // manifestSearch (POST y GET aceptados)
+      if ((method === "POST" || method === "GET") && pathname === "/manifestSearch")
+        return handleManifestSearch(req);
+
+      // packageManifests
+      if (method === "GET" && pathname === "/packageManifests") return handlePackageManifestsAll();
 
       let m = pathname.match(/^\/packageManifests\/([^/]+)$/);
-      if (req.method === "GET" && m) return handlePackageManifestsById(m[1]);
+      if (method === "GET" && m) return handlePackageManifestsById(m[1]);
 
-      if (req.method === "GET" && pathname === "/packages") return handlePackages();
+      // packages
+      if (method === "GET" && pathname === "/packages") return handlePackages();
       m = pathname.match(/^\/packages\/([^/]+)$/);
-      if (req.method === "GET" && m) return handlePackagesById(m[1]);
+      if (method === "GET" && m) return handlePackagesById(m[1]);
 
       m = pathname.match(/^\/packages\/([^/]+)\/versions$/);
-      if (req.method === "GET" && m) return handleVersionsById(m[1]);
+      if (method === "GET" && m) return handleVersionsById(m[1]);
 
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)$/);
-      if (req.method === "GET" && m) return handleVersionDetail(m[1], m[2]);
+      if (method === "GET" && m) return handleVersionDetail(m[1], m[2]);
 
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/installers$/);
-      if (req.method === "GET" && m) return handleInstallers(m[1], m[2]);
+      if (method === "GET" && m) return handleInstallers(m[1], m[2]);
 
       m = pathname.match(/^\/packages\/([^/]+)\/versions\/([^/]+)\/locales$/);
-      if (req.method === "GET" && m) return handleLocales(m[1], m[2]);
+      if (method === "GET" && m) return handleLocales(m[1], m[2]);
 
       return notFound();
     } catch (e: any) {
-      return json({ ErrorCode: "ServerError", Message: e?.message ?? "Unhandled error" }, 500);
+      return json(
+        { ErrorCode: "ServerError", Message: e?.message ?? "Unhandled error" },
+        500,
+      );
     }
   },
 };
